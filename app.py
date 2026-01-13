@@ -230,6 +230,13 @@ def synth_one(
     return wav, sr
 
 
+# ----------------------------
+# Config (hidden: hardcoded)
+# ----------------------------
+repo_id  = "husnainbinmunawar/tigrinya-tts-model"
+revision = "main"
+subdir   = "round_01"
+
 
 # ----------------------------
 # Main UI
