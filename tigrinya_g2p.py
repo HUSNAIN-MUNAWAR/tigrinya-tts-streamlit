@@ -278,6 +278,7 @@ def main_cli():
         digit_strategy=args.digit_strategy,
     )
 
+
     inp = sys.stdin.read()
     sys.stdout.write(g2p(inp, cfg))
 
