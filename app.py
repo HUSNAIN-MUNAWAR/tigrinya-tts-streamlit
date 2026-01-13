@@ -230,19 +230,6 @@ def synth_one(
     return wav, sr
 
 
-# ----------------------------
-# Config (top expander, not sidebar)
-# ----------------------------
-with st.expander("Model & Runtime Settings", expanded=False):
-    c1, c2, c3 = st.columns([1.5, 0.8, 0.8], gap="large")
-    with c1:
-        repo_id = st.text_input("Hugging Face repo_id", value="husnainbinmunawar/tigrinya-tts-model")
-        subdir = st.text_input("Model subfolder (optional)", value="round_01")
-    with c2:
-        revision = st.text_input("Revision", value="main")
-    with c3:
-        st.write(f"Device: **{device}**")
-
 
 # ----------------------------
 # Main UI
