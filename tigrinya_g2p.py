@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import os
 import re
@@ -18,7 +18,7 @@ _MULTI_SPACE = re.compile(r"\s{2,}")
 # Space handling around punctuation:
 # - Remove spaces before punctuation
 # - Ensure exactly one space after punctuation when followed by a letter/number (not newline/end)
-_PUNCT = r"።፣፡፥፧፨!?.,:;()\[\]{}\"'"
+_PUNCT = r"á¢á£á¡á¥á§á¨!?.,:;()\[\]{}\"'"
 _SPACE_BEFORE_PUNCT = re.compile(rf"\s+([{_PUNCT}])")
 _SPACE_AFTER_PUNCT = re.compile(rf"([{_PUNCT}])([^\s{_PUNCT}])")  # Punct immediately followed by text
 
@@ -27,24 +27,24 @@ _MULTI_STOP = re.compile(r"[.]{3,}")                # ..... -> ...
 
 # Digits (optional spacing)
 _DIGIT_RE = re.compile(r"\d+")
-_LETTER_DIGIT = re.compile(r"([A-Za-zኀ-ፚ])(\d)")
-_DIGIT_LETTER = re.compile(r"(\d)([A-Za-zኀ-ፚ])")
+_LETTER_DIGIT = re.compile(r"([A-Za-záŠ€-áš])(\d)")
+_DIGIT_LETTER = re.compile(r"(\d)([A-Za-záŠ€-áš])")
 
 
 # Ethiopic punctuation normalization map (safe)
 PUNCT_MAP = {
-    "。": "።",
-    "，": "፣",
-    "؛": ";",
-    "؟": "?",
-    "“": '"',
-    "”": '"',
-    "„": '"',
-    "’": "'",
-    "‘": "'",
-    "‐": "-",
-    "–": "-",
-    "—": "-",
+    "ã€‚": "á¢",
+    "ï¼Œ": "á£",
+    "Ø›": ";",
+    "ØŸ": "?",
+    "â€œ": '"',
+    "â€": '"',
+    "â€ž": '"',
+    "â€™": "'",
+    "â€˜": "'",
+    "â€": "-",
+    "â€“": "-",
+    "â€”": "-",
 }
 
 
@@ -116,7 +116,7 @@ def _normalize_digits(text: str, strategy: str) -> str:
     strategy = (strategy or "separate_words").lower().strip()
 
     if strategy == "keep":
-        # Just ensure digits don’t stick to letters: "abc12" -> "abc 12"
+        # Just ensure digits donâ€™t stick to letters: "abc12" -> "abc 12"
         text = _LETTER_DIGIT.sub(r"\1 \2", text)
         text = _DIGIT_LETTER.sub(r"\1 \2", text)
         return _MULTI_SPACE.sub(" ", text).strip()
@@ -140,7 +140,7 @@ def normalize_only(text: str, digit_strategy: str = "separate_words") -> str:
     text = _unicode_normalize(text)
     text = _normalize_whitespace(text)
     text = _normalize_punct(text)
-    text = _normalize_digits(text, digit_strategy=digit_strategy)
+    text = _normalize_digits(text, strategy=digit_strategy)
     return text
 
 
@@ -281,3 +281,4 @@ def main_cli():
 
 if __name__ == "__main__":
     main_cli()
+
