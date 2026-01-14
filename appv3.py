@@ -1,4 +1,4 @@
-# app.py — Tigrinya TTS (same UI) + hidden load/session management (NO DB)
+# app.py — Queued Tigrinya TTS (NO DB). Stable queue across Streamlit reruns.
 from __future__ import annotations
 
 import os
@@ -7,38 +7,37 @@ import time
 import uuid
 import threading
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import streamlit as st
 
 from tigrinya_g2p import g2p, G2PConfig, parse_rules
-from inference import synthesize_text, to_wav_bytes, warmup_model
+from inference import synthesize_text, to_wav_bytes
 
 
 # ----------------------------
-# Hidden config (no settings shown on UI)
+# Hidden config
 # ----------------------------
 REPO_ID = os.getenv("HF_REPO_ID", "husnainbinmunawar/tigrinya-tts-model")
 REVISION = os.getenv("HF_REVISION", "main")
-SUBDIR = os.getenv("HF_SUBDIR", "")  # IMPORTANT: "" if files are in repo root
+SUBDIR = os.getenv("HF_SUBDIR", "")
 
 KEEP_ALIVE_MS = int(os.getenv("KEEP_ALIVE_MS", "5000"))
 
-# Safety limits (free tier protection)
 MAX_CHARS = int(os.getenv("MAX_CHARS", "1200"))
 MAX_CHUNKS = int(os.getenv("MAX_CHUNKS", "10"))
-
-# Queue protection
 QUEUE_MAX_JOBS = int(os.getenv("QUEUE_MAX_JOBS", "200"))
 
-# Cleanup (prevents memory leak)
-JOB_TTL_SEC = int(os.getenv("JOB_TTL_SEC", "900"))          # keep finished jobs for up to 15 min
+HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "15"))
+POLL_MS = int(os.getenv("POLL_MS", "900"))
+
+JOB_TTL_SEC = int(os.getenv("JOB_TTL_SEC", "1200"))
 CLEANUP_EVERY_SEC = int(os.getenv("CLEANUP_EVERY_SEC", "20"))
 
 
 # ----------------------------
-# Page + style (UNCHANGED)
+# UI basics
 # ----------------------------
 st.set_page_config(page_title="Tigrinya TTS", layout="wide", initial_sidebar_state="collapsed")
 
@@ -52,12 +51,14 @@ footer {visibility:hidden;}
 [data-testid="stSidebarNav"] {display:none !important;}
 [data-testid="collapsedControl"] {display:none !important;}
 
-/* Compact layout */
 .block-container {padding-top:0.55rem; padding-bottom:0.8rem; padding-left:0.9rem; padding-right:0.9rem; max-width: 1200px;}
 h1 {margin:0.05rem 0 0.3rem 0;}
 .small {color: rgba(49, 51, 63, 0.70); font-size:0.90rem; line-height:1.25;}
 .card {border:1px solid rgba(49,51,63,0.14); border-radius:14px; padding:12px; background:rgba(255,255,255,0.65);}
 .hr {height:1px; background:rgba(49,51,63,0.10); margin:10px 0;}
+.badge {padding:6px 10px; border-radius:999px; border:1px solid rgba(49,51,63,0.15); background:rgba(255,255,255,0.75); font-size:0.85rem;}
+.toprow {display:flex; align-items:flex-start; justify-content:space-between; gap:12px;}
+
 div.stButton > button, div.stFormSubmitButton > button {
   background: linear-gradient(90deg, #2D6CDF, #1DB9A6) !important;
   color: white !important;
@@ -72,7 +73,7 @@ div.stButton > button:hover, div.stFormSubmitButton > button:hover { filter: bri
     unsafe_allow_html=True,
 )
 
-# Internal keep-alive while tab is open (does not keep it awake with zero visitors)
+# Keep-alive while tab is open (does NOT guarantee 24/7 uptime)
 st.components.v1.html(
     f"""
 <script>
@@ -86,9 +87,21 @@ st.components.v1.html(
 )
 
 
-# ----------------------------
-# Session helper
-# ----------------------------
+def _safe_rerun_after(ms: int) -> None:
+    """Rerun without relying on deprecated APIs. Works on old+new Streamlit."""
+    ms = int(max(300, ms))
+    time.sleep(ms / 1000.0)
+    if hasattr(st, "rerun"):
+        st.rerun()
+        return
+    if hasattr(st, "experimental_rerun"):
+        st.experimental_rerun()
+        return
+    # last resort: hard reload
+    st.components.v1.html(f"<script>window.location.reload()</script>", height=0)
+    st.stop()
+
+
 def _get_session_id() -> str:
     if "sid" not in st.session_state:
         st.session_state["sid"] = uuid.uuid4().hex
@@ -96,36 +109,23 @@ def _get_session_id() -> str:
 
 
 # ----------------------------
-# Text splitting
-# ----------------------------
-_SPLIT_RE = re.compile(r"(?<=[\u1362.!?\u1367\u1368])\s+|[\r\n]+")
-
-def split_text(text: str) -> List[str]:
-    t = (text or "").strip()
-    if not t:
-        return []
-    parts = [p.strip() for p in _SPLIT_RE.split(t) if p.strip()]
-    return parts if parts else [t]
-
-
-# ----------------------------
-# Hidden queue state (per container)
+# Queue state stored in cache_resource (CRITICAL)
 # ----------------------------
 @dataclass
 class Job:
     job_id: str
-    session_id: str
     created_ts: float
+    session_id: str
     text_chunks: List[str]
     opts: Dict
 
     pct: int = 0
-    msg: str = "Preparing…"     # do not show “Queued” in UI
+    msg: str = "Queued"
     done: bool = False
     error: Optional[str] = None
     wav_bytes: Optional[bytes] = None
+    sr: Optional[int] = None
     updated_ts: float = 0.0
-    event: threading.Event = field(default_factory=threading.Event)
 
 
 @dataclass
@@ -136,10 +136,30 @@ class QueueState:
     queue: List[str] = field(default_factory=list)
     jobs: Dict[str, Job] = field(default_factory=dict)
     active_job_id: Optional[str] = None
+
+    aud_lock: threading.Lock = field(default_factory=threading.Lock)
+    audience: Dict[str, float] = field(default_factory=dict)
+
     started: bool = False
 
     def __post_init__(self):
         self.cond = threading.Condition(self.lock)
+
+
+def _cleanup_loop(state: QueueState) -> None:
+    while True:
+        time.sleep(max(5, CLEANUP_EVERY_SEC))
+        now = time.time()
+        with state.lock:
+            # Drop completed jobs after TTL
+            for jid in list(state.jobs.keys()):
+                j = state.jobs[jid]
+                idle = now - float(j.updated_ts or j.created_ts)
+                if j.done and idle > JOB_TTL_SEC:
+                    state.jobs.pop(jid, None)
+
+            # Keep queue consistent
+            state.queue[:] = [jid for jid in state.queue if jid in state.jobs]
 
 
 def _job_cb(state: QueueState, job_id: str):
@@ -148,7 +168,6 @@ def _job_cb(state: QueueState, job_id: str):
             j = state.jobs.get(job_id)
             if j and not j.done:
                 j.pct = int(max(0, min(100, pct)))
-                # keep messages neutral; no “queue” words
                 j.msg = str(msg)
                 j.updated_ts = time.time()
     return cb
@@ -157,7 +176,7 @@ def _job_cb(state: QueueState, job_id: str):
 def _run_one_job(state: QueueState, job: Job) -> None:
     with state.lock:
         job.pct = 5
-        job.msg = "Loading model…"
+        job.msg = "Loading model / warming up…"
         job.updated_ts = time.time()
 
     cb = _job_cb(state, job.job_id)
@@ -167,7 +186,7 @@ def _run_one_job(state: QueueState, job: Job) -> None:
 
     for idx, part in enumerate(job.text_chunks, start=1):
         with state.lock:
-            job.msg = "Generating audio…"
+            job.msg = f"Generating chunk {idx}/{len(job.text_chunks)}…"
             job.updated_ts = time.time()
 
         wav, sr, _dbg = synthesize_text(part, job.opts, cb=cb)
@@ -181,16 +200,19 @@ def _run_one_job(state: QueueState, job: Job) -> None:
             audios.append(np.zeros((int(sr_ref * gap_ms / 1000.0),), dtype=np.float32))
 
     out_sr = int(sr_ref or 16000)
-    out_audio = np.concatenate([np.asarray(a, dtype=np.float32) for a in audios]) if audios else np.zeros((0,), np.float32)
+    out_audio = (
+        np.concatenate([np.asarray(a, dtype=np.float32) for a in audios])
+        if audios else np.zeros((0,), np.float32)
+    )
     wav_bytes = to_wav_bytes(out_audio, out_sr)
 
     with state.lock:
         job.wav_bytes = wav_bytes
+        job.sr = out_sr
         job.pct = 100
         job.msg = "Done"
         job.done = True
         job.updated_ts = time.time()
-        job.event.set()
 
 
 def _worker_loop(state: QueueState) -> None:
@@ -217,25 +239,9 @@ def _worker_loop(state: QueueState) -> None:
                 job.msg = "Failed"
                 job.pct = 100
                 job.updated_ts = time.time()
-                job.event.set()
         finally:
             with state.lock:
                 state.active_job_id = None
-
-
-def _cleanup_loop(state: QueueState) -> None:
-    while True:
-        time.sleep(max(5, CLEANUP_EVERY_SEC))
-        now = time.time()
-        with state.lock:
-            # Remove old finished jobs
-            for jid in list(state.jobs.keys()):
-                j = state.jobs[jid]
-                last = float(j.updated_ts or j.created_ts)
-                if j.done and (now - last) > JOB_TTL_SEC:
-                    state.jobs.pop(jid, None)
-            # Remove queue entries pointing to missing jobs
-            state.queue[:] = [jid for jid in state.queue if jid in state.jobs]
 
 
 def _start_threads(state: QueueState) -> None:
@@ -243,6 +249,7 @@ def _start_threads(state: QueueState) -> None:
         if state.started:
             return
         state.started = True
+
     threading.Thread(target=_worker_loop, args=(state,), daemon=True).start()
     threading.Thread(target=_cleanup_loop, args=(state,), daemon=True).start()
 
@@ -254,14 +261,31 @@ def get_state() -> QueueState:
     return s
 
 
-def _enqueue_job(state: QueueState, job: Job) -> None:
-    with state.cond:
-        # guard: queue size only (jobs dict cleanup handles dict growth)
-        if len(state.queue) >= QUEUE_MAX_JOBS:
-            raise RuntimeError("Please try again in a moment.")
-        state.jobs[job.job_id] = job
-        state.queue.append(job.job_id)
-        state.cond.notify()
+def _heartbeat_and_count(state: QueueState) -> int:
+    sid = _get_session_id()
+    now = time.time()
+    with state.aud_lock:
+        state.audience[sid] = now
+        dead_before = now - (HEARTBEAT_SEC * 2.5)
+        for k in list(state.audience.keys()):
+            if state.audience[k] < dead_before:
+                state.audience.pop(k, None)
+        return len(state.audience)
+
+
+def _queue_snapshot(state: QueueState) -> Tuple[Optional[str], List[str]]:
+    with state.lock:
+        return state.active_job_id, list(state.queue)
+
+
+def _queue_position(state: QueueState, job_id: str) -> Tuple[int, int]:
+    active, q = _queue_snapshot(state)
+    total = (1 if active else 0) + len(q)
+    if active == job_id:
+        return 0, total
+    if job_id in q:
+        return q.index(job_id) + 1, total
+    return -1, total
 
 
 def _get_job(state: QueueState, job_id: str) -> Optional[Job]:
@@ -269,34 +293,125 @@ def _get_job(state: QueueState, job_id: str) -> Optional[Job]:
         return state.jobs.get(job_id)
 
 
-# ----------------------------
-# OPTIONAL: silent warmup (no UI)
-# Speeds up first request after cold start.
-# ----------------------------
-@st.cache_resource
-def _warmup_once() -> bool:
-    try:
-        warmup_model(REPO_ID, REVISION, SUBDIR)
-    except Exception:
-        pass
-    return True
-
-_warmup_once()
+def _enqueue_job(state: QueueState, job: Job) -> None:
+    with state.cond:
+        # depth guard
+        if len(state.queue) >= QUEUE_MAX_JOBS:
+            raise RuntimeError("Queue is full. Please try again later.")
+        state.jobs[job.job_id] = job
+        state.queue.append(job.job_id)
+        state.cond.notify()
 
 
 # ----------------------------
-# Header (UNCHANGED)
+# Text splitting
 # ----------------------------
-st.title("Tigrinya Text-to-Speech")
-st.markdown('<div class="small">Fine-tuned VITS (HF) → Generate audio → Play + Download</div>', unsafe_allow_html=True)
+_SPLIT_RE = re.compile(r"(?<=[\u1362.!?\u1367\u1368])\s+|[\r\n]+")
+
+def split_text(text: str) -> List[str]:
+    t = (text or "").strip()
+    if not t:
+        return []
+    parts = [p.strip() for p in _SPLIT_RE.split(t) if p.strip()]
+    return parts if parts else [t]
 
 
 # ----------------------------
-# UI (UNCHANGED layout) — use FORM so typed content doesn’t get lost
+# State + top bar (audience/queue via fragment so it updates without killing sessions)
 # ----------------------------
-left, right = st.columns([1.6, 1.0], gap="large")
+state = get_state()
 
+# Streamlit 1.52+ supports fragments; this updates ONLY the badges, not the entire app.
+@st.fragment(run_every=f"{HEARTBEAT_SEC}s")
+def audience_widget():
+    audience = _heartbeat_and_count(state)
+    active_id, queue_list = _queue_snapshot(state)
+    queue_depth = len(queue_list) + (1 if active_id else 0)
+    st.markdown(
+        f"""
+        <div style="display:flex; gap:10px; justify-content:flex-end; flex-wrap:wrap;">
+          <div class="badge">Live audience: <b>{audience}</b></div>
+          <div class="badge">Queue depth: <b>{queue_depth}</b></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+title_col, badge_col = st.columns([1.8, 1.0], vertical_alignment="top")
+with title_col:
+    st.markdown(
+        """
+<div class="toprow">
+  <div>
+    <h1 style="margin:0;">Tigrinya Text-to-Speech</h1>
+    <div class="small">Queued generation: users wait in line; stable on Streamlit Community.</div>
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+with badge_col:
+    audience_widget()
+
+
+# ----------------------------
+# Job UI (polls while waiting/running)
+# ----------------------------
+def _show_job_ui(job_id: str) -> None:
+    job = _get_job(state, job_id)
+    if not job:
+        # Silent reset only (no annoying messages)
+        st.session_state.pop("job_id", None)
+        return
+
+    pos, total = _queue_position(state, job_id)
+
+    st.progress(int(job.pct))
+    if pos == 0:
+        st.markdown(f"<div class='small'><b>Running</b> — {job.msg}</div>", unsafe_allow_html=True)
+    elif pos > 0:
+        st.markdown(
+            f"<div class='small'><b>Queued</b> — position {pos} of {total}. {job.msg}</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(f"<div class='small'>{job.msg}</div>", unsafe_allow_html=True)
+
+    if job.done:
+        if job.error:
+            st.error(f"Generation failed: {job.error}")
+        elif job.wav_bytes:
+            st.session_state["last_wav_bytes"] = job.wav_bytes
+            st.audio(job.wav_bytes, format="audio/wav")
+            st.download_button(
+                "Download WAV",
+                job.wav_bytes,
+                file_name="tigrinya_tts.wav",
+                mime="audio/wav",
+                use_container_width=True,
+            )
+        st.session_state.pop("job_id", None)
+        return
+
+    _safe_rerun_after(POLL_MS)
+
+
+# If user already has a job, show it and do NOT allow new submission yet
+if "job_id" in st.session_state:
+    _show_job_ui(st.session_state["job_id"])
+    if "last_wav_bytes" in st.session_state:
+        st.markdown("<div class='small'>Last generated output:</div>", unsafe_allow_html=True)
+        st.audio(st.session_state["last_wav_bytes"], format="audio/wav")
+    st.stop()
+
+
+# ----------------------------
+# Main UI inside a FORM (prevents typing interruptions from reruns)
+# ----------------------------
 with st.form("tts_form", clear_on_submit=False):
+    left, right = st.columns([1.6, 1.0], gap="large")
+
     with left:
         st.markdown("#### Text")
         text = st.text_area(
@@ -305,6 +420,8 @@ with st.form("tts_form", clear_on_submit=False):
             placeholder="ኣብዚ ጽሑፍ ኣእትዉ።",
             label_visibility="collapsed",
         )
+        if text and len(text) > MAX_CHARS:
+            st.warning(f"Max {MAX_CHARS} chars (free tier protection). Please shorten.")
 
         st.markdown("#### G2P")
         g2p_enabled = st.toggle("Enable G2P", value=True)
@@ -341,25 +458,14 @@ with st.form("tts_form", clear_on_submit=False):
 
 
 # ----------------------------
-# Generation (same UX; hidden queue behind it)
+# Enqueue new job
 # ----------------------------
-state = get_state()
-
-# Prevent one session from spamming multiple jobs (double-click / resubmit)
-if "active_job_id" not in st.session_state:
-    st.session_state["active_job_id"] = None
-
 if gen_btn:
-    if st.session_state["active_job_id"]:
-        st.warning("Please wait for the current generation to finish.")
-        st.stop()
-
     if not (text or "").strip():
         st.error("Please enter text.")
         st.stop()
-
     if len(text) > MAX_CHARS:
-        st.error(f"Please keep text under {MAX_CHARS} characters.")
+        st.error(f"Too long. Max {MAX_CHARS} characters.")
         st.stop()
 
     rules = parse_rules(rules_text) if (rules_text or "").strip() else []
@@ -374,7 +480,7 @@ if gen_btn:
 
     try:
         processed = g2p(text, cfg) if g2p_enabled else text
-        processed = processed.strip() if processed else text.strip()
+        processed = (processed.strip() if processed else text.strip())
     except Exception:
         processed = text.strip()
 
@@ -383,16 +489,15 @@ if gen_btn:
 
     parts = split_text(processed) if split_long else [processed]
     parts = [p for p in parts if p.strip()]
+
     if not parts:
         st.error("No text to synthesize.")
         st.stop()
-
     if len(parts) > MAX_CHUNKS:
+        st.warning(f"Too many chunks ({len(parts)}). Limiting to {MAX_CHUNKS}.")
         parts = parts[:MAX_CHUNKS]
 
-    job_id = uuid.uuid4().hex
     session_id = _get_session_id()
-
     opts = {
         "repo_id": REPO_ID,
         "revision": REVISION,
@@ -406,14 +511,16 @@ if gen_btn:
         "min_tokens": 3,
     }
 
+    job_id = uuid.uuid4().hex
     job = Job(
         job_id=job_id,
-        session_id=session_id,
         created_ts=time.time(),
+        session_id=session_id,
         text_chunks=parts,
         opts=opts,
         pct=0,
-        msg="Preparing…",  # neutral
+        msg="Queued…",
+        done=False,
         updated_ts=time.time(),
     )
 
@@ -423,43 +530,11 @@ if gen_btn:
         st.error(str(e))
         st.stop()
 
-    st.session_state["active_job_id"] = job_id
+    st.session_state["job_id"] = job_id
+    _show_job_ui(job_id)
 
-    progress = st.progress(0)
-    status = st.empty()
 
-    # Wait efficiently (no busy polling)
-    while True:
-        j = _get_job(state, job_id)
-        if not j:
-            st.session_state["active_job_id"] = None
-            st.error("Generation failed. Please try again.")
-            st.stop()
-
-        progress.progress(int(j.pct))
-        status.markdown(f"<div class='small'>{j.msg}</div>", unsafe_allow_html=True)
-
-        if j.done:
-            st.session_state["active_job_id"] = None
-            if j.error:
-                st.error(f"Synthesis failed: {j.error}")
-                st.stop()
-            if not j.wav_bytes:
-                st.error("Synthesis failed. Please try again.")
-                st.stop()
-
-            # Keep bytes in session so Streamlit doesn't lose media
-            st.session_state["wav_bytes"] = j.wav_bytes
-
-            st.audio(st.session_state["wav_bytes"], format="audio/wav")
-            st.download_button(
-                "Download WAV",
-                st.session_state["wav_bytes"],
-                file_name="tigrinya_tts.wav",
-                mime="audio/wav",
-                use_container_width=True,
-            )
-            break
-
-        # block until progress changes or completion (low CPU)
-        j.event.wait(timeout=0.35)
+# Last generated audio (stable)
+if "last_wav_bytes" in st.session_state:
+    st.markdown("<div class='small'>Last generated output:</div>", unsafe_allow_html=True)
+    st.audio(st.session_state["last_wav_bytes"], format="audio/wav")
